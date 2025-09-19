@@ -1,195 +1,305 @@
-import time, math
-import numpy as np, pandas as pd
+# backend/app/predictor.py
+import os
+import math
+import logging
+from typing import Optional
+from cachetools import TTLCache, cached
+import joblib
+import numpy as np
+import pandas as pd
+
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
-from cachetools import TTLCache
-from .utils import fetch_current_price, fetch_history, fetch_profile
+from sklearn.preprocessing import StandardScaler
 
-# in-memory cache
-CACHE = TTLCache(maxsize=200, ttl=60*60*4)
-HORIZON_DAYS = {'3-15_days':10, '1-3_months':45, '3-6_months':120, '1-3_years':540}
+from .utils import fetch_history, fetch_current_price, fetch_profile
 
-def build_features_from_history(hist, lookback=30, forward=30):
-    if not hist or len(hist) < (lookback + forward):
-        return None
-    hist_old = list(reversed(hist))
-    closes = [float(h['close']) for h in hist_old]
-    df = pd.DataFrame({'close': closes})
-    df['ret1'] = df['close'].pct_change().fillna(0)
-    df['ret5'] = df['close'].pct_change(5).fillna(0)
-    df['sma10'] = df['close'].rolling(10).mean().fillna(method='bfill')
-    df['sma30'] = df['close'].rolling(30).mean().fillna(method='bfill')
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = df['ema12'] - df['ema26']
-    delta = df['close'].diff()
-    up = delta.clip(lower=0).rolling(14).mean()
-    down = -delta.clip(upper=0).rolling(14).mean()
-    rs = up / (down + 1e-9)
-    df['rsi'] = 100 - 100/(1+rs)
-    rows = []
-    for i in range(0, len(df) - lookback - forward + 1):
-        win = df.iloc[i:i+lookback]
-        future = df.iloc[i+lookback+forward-1]
-        feat = [
-            win['close'].iloc[-1],
-            win['ret1'].iloc[-1],
-            win['ret5'].iloc[-1],
-            (win['sma10'].iloc[-1] - win['sma30'].iloc[-1]),
-            win['macd'].iloc[-1],
-            win['rsi'].iloc[-1],
-            win['close'].std()
+logger = logging.getLogger("fingrow.predictor")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# Simple in-memory cache for predictions (personal use). TTL = 4 hours
+PRED_CACHE = TTLCache(maxsize=2000, ttl=60 * 60 * 4)
+
+def _compute_features_from_df(df: pd.DataFrame):
+    """
+    df is newest-first. Return X (n_samples, n_features) and y (next_return).
+    We'll build features as recent lag returns and rolling volatility.
+    """
+    if df is None or df.empty:
+        return None, None
+    # use oldest-first for sliding windows
+    df2 = df.sort_values("date", ascending=True).reset_index(drop=True)
+    closes = df2["close"].values
+    if len(closes) < 8:
+        return None, None
+
+    window = 5  # features lookback
+    X = []
+    y = []
+    for i in range(window, len(closes)-1):
+        past = closes[i-window:i]
+        # log returns
+        returns = np.diff(past) / past[:-1]
+        feat = list(returns)  # length window-1
+        feat += [
+            np.mean(returns),
+            np.std(returns),
+            (closes[i] - np.mean(past)) / np.mean(past)  # price relative to mean
         ]
-        label = (future['close'] - win['close'].iloc[-1]) / win['close'].iloc[-1]
-        rows.append((feat, label))
-    if not rows:
-        return None
-    X = np.array([r[0] for r in rows])
-    y = np.array([r[1] for r in rows])
+        X.append(feat)
+        # target is next period return
+        next_ret = (closes[i+1] - closes[i]) / closes[i]
+        y.append(next_ret)
+    if not X:
+        return None, None
+    X = np.array(X)
+    y = np.array(y)
     return X, y
 
-def indicator_only_recommendation(current_price, features_last):
-    rsi = features_last.get('rsi', 50)
-    sma_diff = features_last.get('sma_diff', 0)
-    if rsi > 70:
-        return 'Sell', 'RSI is high which often precedes pullbacks.'
-    if sma_diff > 0:
-        return 'Buy', 'Price is above shorter-term average which indicates upward trend.'
-    return 'Hold', 'No strong signals found — consider waiting.'
+def _train_quick_model(X, y):
+    # small pipeline: standardize + ridge
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    model = Ridge(alpha=1.0)
+    model.fit(Xs, y)
+    return model, scaler
 
-def build_features_last(hist):
-    closes = [float(h['close']) for h in reversed(hist)]
-    if len(closes) < 5:
-        return {}
-    s10 = pd.Series(closes).rolling(10).mean().iloc[-1]
-    s30 = pd.Series(closes).rolling(30).mean().iloc[-1]
-    rsi_val = pd.Series(closes).diff().clip(lower=0).rolling(14).mean().iloc[-1] if len(closes) >= 14 else 50
-    return {'sma10': s10, 'sma30': s30, 'sma_diff': s10 - s30, 'rsi': float(rsi_val)}
+def _safe_round(v, nd=2):
+    try:
+        return round(float(v), nd)
+    except Exception:
+        return None
 
-def predict_stock(ticker, horizon, fmp_key):
-    key = fmp_key
-    cache_key = f"{ticker}:{horizon}:{key}"
-    if cache_key in CACHE:
-        return CACHE[cache_key]
-    hist = fetch_history(ticker, key, timeseries=800)
-    cur = fetch_current_price(ticker, key)
-    profile = fetch_profile(ticker, key) if key else {}
-    if not hist or not cur:
-        raise RuntimeError("Unable to fetch data for ticker. Check FMP API key and symbol.")
-    features_last = build_features_last(hist)
-    lf = 30
-    forward = {'3-15_days':10, '1-3_months':45, '3-6_months':120, '1-3_years':540}.get(horizon,45)
-    XY = build_features_from_history(hist, lookback=lf, forward=forward)
-    if XY is None:
-        decision, reason = indicator_only_recommendation(cur['price'], features_last)
+def _recommendation_from_pred(current_price, predicted_price, confidence):
+    # simple rules for recommendation
+    if current_price <= 0 or predicted_price <= 0:
+        return {"decision": "No Data", "plain_language_reason": "Price data missing."}
+    ret_pct = (predicted_price - current_price) / current_price * 100
+    if confidence >= 65 and ret_pct >= 5:
+        decision = "Strong Buy"
+    elif confidence >= 50 and ret_pct >= 3:
+        decision = "Buy"
+    elif confidence >= 40 and abs(ret_pct) < 3:
+        decision = "Hold"
+    elif ret_pct <= -5:
+        decision = "Strong Sell"
+    else:
+        decision = "Sell" if ret_pct < 0 else "Hold"
+    reason = f"Predicted return {ret_pct:.2f}% with confidence {confidence}/100."
+    return {
+        "decision": decision,
+        "buy_below": _safe_round(current_price * 0.98, 2),
+        "sell_target": _safe_round(predicted_price, 2),
+        "hold_until": _safe_round(predicted_price, 2),
+        "stop_loss": _safe_round(current_price * 0.9, 2),
+        "plain_language_reason": reason
+    }
+
+@cached(PRED_CACHE)
+def predict_stock(ticker: str, horizon: str, fmp_key: Optional[str]):
+    """
+    Main predict function.
+    Returns a dict with keys:
+      ticker, current_price, predicted_price, predicted_return_percent,
+      confidence_score, quantiles, momentum, fundamentals_score, recommendation, top_factors, model
+    """
+    ticker = ticker.strip().upper()
+    # 1) fetch current price
+    current = fetch_current_price(ticker, fmp_key) or {"price": None}
+    current_price = float(current.get("price") or 0.0)
+
+    # 2) try history
+    try:
+        rows, hist_source = fetch_history(ticker, fmp_key, timeseries=180)
+    except Exception as e:
+        logger.info("History fetch failed for %s: %s", ticker, str(e))
+        # fallback conservative estimate (low-confidence)
+        horizon_map = {
+            '3-15_days': 0.01,
+            '1-3_months': 0.03,
+            '3-6_months': 0.06,
+            '1-3_years': 0.12
+        }
+        drift = horizon_map.get(horizon, 0.03)
+        predicted_price = _safe_round(current_price * (1 + drift), 2) if current_price > 0 else 0.0
+        implied_return = _safe_round(((predicted_price - current_price) / current_price * 100) if current_price > 0 else 0.0, 2)
+        profile = fetch_profile(ticker, fmp_key) or {}
         out = {
             "ticker": ticker,
-            "current_price": round(float(cur['price']),2),
-            "predicted_price": round(float(cur['price']),2),
-            "predicted_return_percent": 0.0,
-            "momentum": "Neutral",
-            "fundamentals_score": 50,
+            "current_price": _safe_round(current_price,2),
+            "predicted_price": predicted_price,
+            "predicted_return_percent": implied_return,
+            "confidence_score": 18,
+            "quantiles": {"p05": _safe_round(predicted_price * 0.9,2), "p95": _safe_round(predicted_price * 1.1,2)},
+            "momentum": {"label": "Neutral"},
+            "fundamentals_score": int(profile.get("rating", 50) if isinstance(profile.get("rating", None), (int, float)) else 50),
             "recommendation": {
-                "decision": decision,
-                "buy_below": round(float(cur['price']) * 0.95, 2),
-                "sell_target": round(float(cur['price']) * 1.03, 2),
-                "stop_loss": round(float(cur['price']) * 0.9, 2),
-                "plain_language_reason": reason
-            }
+                "decision": "Hold",
+                "buy_below": _safe_round(current_price * 0.97,2),
+                "sell_target": predicted_price,
+                "hold_until": predicted_price,
+                "stop_loss": _safe_round(current_price * 0.9,2),
+                "plain_language_reason": (
+                    "We could not fetch historical data for this ticker from the data sources. "
+                    "So we returned a conservative, low-confidence estimate using the current price and a short-term rule-of-thumb. "
+                    "Provide a paid data API key or try again later for a full prediction."
+                )
+            },
+            "top_factors": [
+                {"name": "Data status", "why": "Checked multiple providers; no usable history"},
+                {"name": "Fallback logic", "why": f"Used fallback drift {drift*100:.1f}% for horizon {horizon}"}
+            ],
+            "model": {"name":"fallback-indicator","version":"0.1"},
+            "data_source": "None"
         }
-        CACHE[cache_key] = out
         return out
-    X, y = XY
-    try:
-        model = Ridge(alpha=1.0)
-        model.fit(X, y)
-        preds = model.predict(X)
-        resid = y - preds
-        resid_std = float(np.std(resid))
-        last_feats = X[-1].reshape(1, -1)
-        pred_return = float(model.predict(last_feats)[0])
-    except Exception:
+
+    # Build DataFrame from rows (rows are newest-first)
+    df = None
+    if rows:
         try:
-            rf = RandomForestRegressor(n_estimators=30, max_depth=4, random_state=42)
-            rf.fit(X, y)
-            pred_return = float(rf.predict(X[-1].reshape(1,-1))[0])
-            resid_std = float(np.std(y - rf.predict(X)))
+            df = pd.DataFrame(rows)
+            # ensure numeric
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df['date'] = pd.to_datetime(df['date'])
+            # newest-first is already expected by code; predictor will convert where needed
+        except Exception as e:
+            logger.info("Error building dataframe for %s: %s", ticker, str(e))
+            df = None
+
+    n_hist = len(rows) if rows else 0
+
+    # Compute momentum simple label using last 5 close returns if available
+    momentum_label = "Neutral"
+    if df is not None and len(df) >= 6:
+        closes = list(df['close'])
+        # newest-first -> last returns use first elements
+        try:
+            last5 = closes[:6]  # newest-first slice
+            # compute percent change over last 5 days
+            pct = (last5[0] - last5[-1]) / (last5[-1] or 1)
+            if pct > 0.06:
+                momentum_label = "Strong Positive"
+            elif pct > 0.015:
+                momentum_label = "Positive"
+            elif pct < -0.06:
+                momentum_label = "Strong Negative"
+            elif pct < -0.015:
+                momentum_label = "Negative"
+            else:
+                momentum_label = "Neutral"
         except Exception:
-            decision, reason = indicator_only_recommendation(cur['price'], features_last)
-            out = {
-                "ticker": ticker,
-                "current_price": round(float(cur['price']),2),
-                "predicted_price": round(float(cur['price']),2),
-                "predicted_return_percent": 0.0,
-                "momentum": "Neutral",
-                "fundamentals_score": 50,
-                "recommendation": {
-                    "decision": decision,
-                    "buy_below": round(float(cur['price']) * 0.95, 2),
-                    "sell_target": round(float(cur['price']) * 1.03, 2),
-                    "stop_loss": round(float(cur['price']) * 0.9, 2),
-                    "plain_language_reason": reason
-                }
-            }
-            CACHE[cache_key] = out
-            return out
-    current_price = float(cur['price'])
-    days = forward
-    scale = (days / 30.0) ** 0.5
-    predicted_price = current_price * (1 + pred_return * scale)
-    implied_return = (predicted_price - current_price) / current_price * 100.0
-    spread = max(0.02, abs(pred_return)*0.6 + resid_std * math.sqrt(days/30.0))
-    p05 = predicted_price * (1 - spread)
-    p95 = predicted_price * (1 + spread)
-    momentum = "Positive" if X[-1][1] > 0.005 else ("Negative" if X[-1][1] < -0.005 else "Neutral")
-    fscore = 50
+            momentum_label = "Neutral"
+
+    # 3) Try to use pre-trained model artifact if present
+    model_path = os.path.join("models", f"{ticker}.joblib")
+    predicted_price = None
+    model_used = None
+    residual_std = 0.05  # default residual for quantiles
+
+    if os.path.exists(model_path):
+        try:
+            mobj = joblib.load(model_path)
+            # mobj expected as dict {'model': model, 'scaler': scaler, 'features': features_meta}
+            model = mobj.get("model")
+            scaler = mobj.get("scaler")
+            # build a feature vector from most recent data if possible
+            Xfeat, _ = _compute_features_from_df(df)
+            if Xfeat is not None and Xfeat.shape[0] >= 1:
+                last_feat = Xfeat[-1].reshape(1, -1)
+                if scaler is not None:
+                    last_feat = scaler.transform(last_feat)
+                pred_ret = model.predict(last_feat)[0]
+                predicted_price = _safe_round(current_price * (1 + float(pred_ret)), 2)
+                model_used = f"pretrained:{os.path.basename(model_path)}"
+                # compute residual std from training metadata if available
+                residual_std = float(mobj.get("resid_std", residual_std))
+        except Exception as e:
+            logger.info("Failed loading pretrained model for %s: %s", ticker, str(e))
+            model_used = None
+
+    # 4) If no pretrained model, but sufficient history, train quick ridge
+    if predicted_price is None and df is not None and n_hist >= 40:
+        X, y = _compute_features_from_df(df)
+        if X is not None and len(y) >= 10:
+            try:
+                model, scaler = _train_quick_model(X, y)
+                # predict using last row
+                lastX = scaler.transform(X[-1].reshape(1, -1))
+                pred_ret = model.predict(lastX)[0]
+                predicted_price = _safe_round(current_price * (1 + float(pred_ret)), 2)
+                model_used = "quick-ridge"
+                residual_std = float(np.std(y - model.predict(scaler.transform(X))))
+            except Exception as e:
+                logger.info("Quick model train failed for %s: %s", ticker, str(e))
+                predicted_price = None
+
+    # 5) If still no predicted_price, fallback to simple drift based on horizon
+    if predicted_price is None:
+        horizon_map = {
+            '3-15_days': 0.01,
+            '1-3_months': 0.03,
+            '3-6_months': 0.06,
+            '1-3_years': 0.12
+        }
+        drift = horizon_map.get(horizon, 0.03)
+        predicted_price = _safe_round(current_price * (1 + drift), 2) if current_price > 0 else 0.0
+        model_used = model_used or "fallback-drfit"
+        residual_std = max(residual_std, 0.06)
+
+    # quantiles using residual_std (conservative)
+    p05 = _safe_round(predicted_price * (1 - 2 * residual_std), 2) if predicted_price else None
+    p95 = _safe_round(predicted_price * (1 + 2 * residual_std), 2) if predicted_price else None
+
+    implied_return = _safe_round(((predicted_price - current_price) / current_price * 100) if current_price > 0 else 0.0, 2)
+
+    # fundamentals score heuristic
+    profile = fetch_profile(ticker, fmp_key) or {}
     try:
-        pe = float(profile.get('priceEarningsRatio') or 0)
-        mcap = float(profile.get('mktCap') or 0)
-        if pe and pe < 15: fscore += 10
-        if mcap and mcap > 1e10: fscore += 10
+        fundamentals_score = int(max(1, min(100, int(profile.get("rating") or profile.get("score") or 50))))
     except Exception:
-        pass
-    sigma_q = (p95 - p05)/2
-    buy_threshold = predicted_price - 0.8 * sigma_q
-    sell_target = predicted_price + 0.5 * sigma_q
-    stop_loss = current_price * 0.88
-    if current_price <= buy_threshold and implied_return >= 6:
-        decision = 'Buy below'
-        reason = f"The model expects a good upside ({implied_return:.1f}%) and momentum is {momentum}."
-    elif implied_return >= 3 and fscore >= 40:
-        decision = 'Hold'
-        reason = f"The expected return is {implied_return:.1f}% and fundamentals look reasonable (score {fscore})."
+        fundamentals_score = 50
+
+    # Compute base confidence and adjust by source + history length
+    base_conf = 60
+    src = hist_source or "Unknown"
+    if src.startswith("NSEpy"):
+        source_bonus = 15
+    elif src.startswith("FMP"):
+        source_bonus = 12
+    elif src.lower().startswith("yahoo") or src.lower().startswith("yfinance"):
+        source_bonus = 5
     else:
-        decision = 'Sell'
-        reason = f"Expected return only {implied_return:.1f}%, momentum {momentum}."
-    plain = (
-        f"We see current price {current_price:.2f}. The hybrid model predicts ~{predicted_price:.2f} "
-        f"for the chosen horizon (implied return {implied_return:.1f}%). {reason} "
-        f"Key factors: recent returns, MA/EMA signals and RSI."
-    )
+        source_bonus = 0
+    length_bonus = min(30, int(n_hist / 10))
+    penalty = int(min(30, abs(implied_return) * 2))
+    final_conf = max(5, min(95, int(base_conf + source_bonus + length_bonus - penalty)))
+
+    # Build recommendation
+    recommendation = _recommendation_from_pred(current_price, predicted_price, final_conf)
+
     out = {
         "ticker": ticker,
-        "current_price": round(current_price, 2),
-        "predicted_price": round(predicted_price, 2),
-        "predicted_return_percent": round(implied_return, 2),
-        "confidence_score": max(20, min(95, int(80 - abs(pred_return)*200))),
-        "quantiles": {"p05": round(p05,2), "p95": round(p95,2)},
-        "momentum": {"label": momentum},
-        "fundamentals_score": int(max(1,min(100,fscore))),
-        "recommendation": {
-            "decision": decision,
-            "buy_below": round(buy_threshold,2),
-            "sell_target": round(sell_target,2),
-            "hold_until": round(sell_target,2),
-            "stop_loss": round(stop_loss,2),
-            "plain_language_reason": plain
-        },
+        "current_price": _safe_round(current_price, 2),
+        "predicted_price": predicted_price,
+        "predicted_return_percent": implied_return,
+        "confidence_score": final_conf,
+        "quantiles": {"p05": p05, "p95": p95},
+        "momentum": {"label": momentum_label},
+        "fundamentals_score": fundamentals_score,
+        "recommendation": recommendation,
         "top_factors": [
-            {"name":"Recent returns","why":"Short-term return pattern"},
-            {"name":"MA/EMA/RSI","why":"Technical indicators influence the model"}
+            {"name": "Data source", "why": f"{src} (n={n_hist})"},
+            {"name": "Model used", "why": model_used or "fallback"},
+            {"name": "Recent momentum", "why": momentum_label}
         ],
-        "model": {"name":"hybrid-on-demand","version":"1.0"}
+        "model": {"name": model_used or "fallback", "version": "1.0"},
+        "data_source": f"{src} (n={n_hist})"
     }
-    CACHE[cache_key] = out
+
+    logger.info("PREDICT | ticker=%s source=%s n=%d conf=%d model=%s", ticker, src, n_hist, final_conf, model_used)
     return out
