@@ -8,3 +8,4 @@ scikit-learn
 cachetools
 joblib
 yfinance==0.2.24
+nsepy
