@@ -13,7 +13,7 @@ try:
 except Exception:
     YFINANCE_AVAILABLE = False
 
-# note: nsepy lazy import used inside function
+# note: nsepy lazy import used inside function; we keep a flag if installed at build time
 try:
     import nsepy  # may not be present at runtime
     NSEPY_AVAILABLE = True
@@ -88,21 +88,55 @@ def resolve_symbol(symbol: str, api_key: Optional[str]) -> str:
 
 def fetch_current_price(symbol: str, api_key: Optional[str]) -> Optional[dict]:
     """
-    Return a dict like {"price": <float>} or None.
+    Try to return current price dict {"price": float, "source": "<provider>"}.
+    Order: FMP quote-short -> NSEpy last close -> yfinance last close -> None
     """
-    if not api_key:
-        return None
+    s = symbol.strip().upper()
+
+    # 1) Try FMP
+    if api_key:
+        try:
+            sym = resolve_symbol(s, api_key)
+            url = FMP_QUOTE_URL.format(symbol=sym, key=api_key)
+            r = SESSION.get(url, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    price = data[0].get("price")
+                    if price is not None:
+                        return {"price": float(price), "source": f"FMP (quote:{sym})"}
+        except Exception as e:
+            logger.info("FMP quote failed for %s: %s", s, str(e))
+
+    # 2) Try NSEpy (best for Indian tickers)
     try:
-        sym = resolve_symbol(symbol, api_key)
-        url = FMP_QUOTE_URL.format(symbol=sym, key=api_key)
-        r = SESSION.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list) and data:
-            return {"price": data[0].get("price")}
+        # lazy import to avoid hard dependency at import time
+        from nsepy import get_history  # type: ignore
+        end = date.today()
+        start = end - timedelta(days=7)
+        # nsepy typically expects symbol without suffix
+        symbol_for_nsepy = s.split(".")[0]
+        df = get_history(symbol=symbol_for_nsepy, start=start, end=end)
+        if df is not None and not df.empty:
+            last_row = df.reset_index().iloc[-1]
+            last_close = last_row.get("Close") or last_row.get("close")
+            if last_close is not None:
+                return {"price": float(last_close), "source": "NSEpy"}
     except Exception as e:
-        logger.info("fetch_current_price failed for %s: %s", symbol, str(e))
-        return None
+        logger.info("NSEpy quote failed for %s: %s", s, str(e))
+
+    # 3) Try yfinance
+    if YFINANCE_AVAILABLE:
+        try:
+            t = yf.Ticker(s if "." in s else s + ".NS")
+            df = t.history(period="7d", interval="1d", auto_adjust=False)
+            if df is not None and not df.empty:
+                last_close = df['Close'].iloc[-1]
+                return {"price": float(last_close), "source": "Yahoo"}
+        except Exception as e:
+            logger.info("yfinance quote failed for %s: %s", s, str(e))
+
+    # nothing found
     return None
 
 
