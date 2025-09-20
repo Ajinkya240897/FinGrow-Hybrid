@@ -13,9 +13,8 @@ try:
 except Exception:
     YFINANCE_AVAILABLE = False
 
-# note: nsepy lazy import used inside function; we keep a flag if installed at build time
 try:
-    import nsepy  # may not be present at runtime
+    import nsepy  # for availability check
     NSEPY_AVAILABLE = True
 except Exception:
     NSEPY_AVAILABLE = False
@@ -34,7 +33,6 @@ FMP_QUOTE_URL = "https://financialmodelingprep.com/api/v3/quote-short/{symbol}?a
 FMP_HIST_URL = "https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries={timeseries}&apikey={key}"
 FMP_PROFILE = "https://financialmodelingprep.com/api/v3/profile/{symbol}?apikey={key}"
 
-# Candidate suffixes for Indian tickers
 COMMON_SUFFIXES = ["", ".NS", ".BO"]
 
 # Requests session with retries
@@ -53,7 +51,6 @@ def _requests_session_with_retries(total_retries=3, backoff_factor=0.3):
         session.mount("https://", adapter)
         session.mount("http://", adapter)
     except Exception:
-        # If urllib3 not available, continue with plain session
         pass
     return session
 
@@ -61,10 +58,6 @@ SESSION = _requests_session_with_retries()
 
 
 def resolve_symbol(symbol: str, api_key: Optional[str]) -> str:
-    """
-    Try common suffixes and return the first symbol accepted by FMP quote endpoint.
-    If nothing validates, return the input uppercased.
-    """
     if not symbol:
         raise ValueError("Empty symbol passed to resolve_symbol")
     s = symbol.strip().upper()
@@ -78,72 +71,99 @@ def resolve_symbol(symbol: str, api_key: Optional[str]) -> str:
             if r.status_code == 200:
                 j = r.json()
                 if isinstance(j, list) and len(j) and 'price' in j[0]:
-                    logger.info("Resolved symbol %s -> %s via FMP", s, candidate)
+                    logger.info("Resolved %s -> %s via FMP", s, candidate)
                     return candidate
         except Exception:
             continue
-    logger.info("Could not resolve symbol via FMP; using original symbol %s", s)
+    logger.info("Could not resolve %s via FMP; using original", s)
     return s
 
 
 def fetch_current_price(symbol: str, api_key: Optional[str]) -> Optional[dict]:
     """
-    Try to return current price dict {"price": float, "source": "<provider>"}.
-    Order: FMP quote-short -> NSEpy last close -> yfinance last close -> None
+    Try to get current price with fallbacks.
+    Order: FMP -> yfinance -> NSEpy.
+    Returns {"price": float, "source": "<provider>"} or None.
     """
-    s = symbol.strip().upper()
+    s_raw = (symbol or "").strip()
+    if not s_raw:
+        logger.info("fetch_current_price: empty symbol")
+        return None
+    s = s_raw.upper()
+    logger.info("fetch_current_price: start for %s", s)
 
-    # 1) Try FMP
+    # 1) FMP
     if api_key:
         try:
             sym = resolve_symbol(s, api_key)
             url = FMP_QUOTE_URL.format(symbol=sym, key=api_key)
-            r = SESSION.get(url, timeout=8)
+            r = SESSION.get(url, timeout=10)
+            logger.info("FMP quote status=%s for %s", getattr(r, "status_code", None), sym)
             if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    price = data[0].get("price")
-                    if price is not None:
-                        return {"price": float(price), "source": f"FMP (quote:{sym})"}
+                j = r.json()
+                if isinstance(j, list) and len(j) and 'price' in j[0] and j[0].get('price') is not None:
+                    price = float(j[0].get('price'))
+                    logger.info("Got price %s from FMP for %s", price, sym)
+                    return {"price": price, "source": f"FMP (quote:{sym})"}
         except Exception as e:
-            logger.info("FMP quote failed for %s: %s", s, str(e))
+            logger.info("FMP quote exception for %s: %s", s, str(e))
 
-    # 2) Try NSEpy (best for Indian tickers)
+    # 2) yfinance
+    if YFINANCE_AVAILABLE:
+        y_candidates = []
+        if "." in s:
+            y_candidates = [s, s.replace(".NS", ""), s.replace(".BO", "")]
+        else:
+            y_candidates = [s + ".NS", s, s + ".BO", s + ".NSE"]
+        seen = set(); y_candidates = [c for c in y_candidates if not (c in seen or seen.add(c))]
+        for cand in y_candidates:
+            try:
+                logger.info("Trying yfinance %s", cand)
+                t = yf.Ticker(cand)
+                df = t.history(period="5d", interval="1d")
+                if df is not None and not df.empty:
+                    last_close = df['Close'].iloc[-1]
+                    if last_close:
+                        price = float(last_close)
+                        logger.info("Got price %s from yfinance %s", price, cand)
+                        return {"price": price, "source": f"Yahoo ({cand})"}
+                # fallback: ticker.info
+                try:
+                    info = t.info
+                    for key in ("regularMarketPrice", "previousClose", "currentPrice"):
+                        if key in info and info.get(key):
+                            price = float(info[key])
+                            logger.info("Got price %s from yfinance.info[%s] %s", price, key, cand)
+                            return {"price": price, "source": f"Yahoo.info({cand})"}
+                except Exception:
+                    continue
+            except Exception as e:
+                logger.info("yfinance %s failed: %s", cand, str(e))
+    else:
+        logger.info("yfinance not available")
+
+    # 3) NSEpy
     try:
-        # lazy import to avoid hard dependency at import time
-        from nsepy import get_history  # type: ignore
+        from nsepy import get_history
         end = date.today()
         start = end - timedelta(days=7)
-        # nsepy typically expects symbol without suffix
-        symbol_for_nsepy = s.split(".")[0]
-        df = get_history(symbol=symbol_for_nsepy, start=start, end=end)
+        sym_for_nse = s.split(".")[0]
+        df = get_history(symbol=sym_for_nse, start=start, end=end)
         if df is not None and not df.empty:
             last_row = df.reset_index().iloc[-1]
             last_close = last_row.get("Close") or last_row.get("close")
-            if last_close is not None:
-                return {"price": float(last_close), "source": "NSEpy"}
+            if last_close:
+                price = float(last_close)
+                logger.info("Got price %s from NSEpy %s", price, s)
+                return {"price": price, "source": "NSEpy"}
     except Exception as e:
-        logger.info("NSEpy quote failed for %s: %s", s, str(e))
+        logger.info("NSEpy lookup failed for %s: %s", s, str(e))
 
-    # 3) Try yfinance
-    if YFINANCE_AVAILABLE:
-        try:
-            t = yf.Ticker(s if "." in s else s + ".NS")
-            df = t.history(period="7d", interval="1d", auto_adjust=False)
-            if df is not None and not df.empty:
-                last_close = df['Close'].iloc[-1]
-                return {"price": float(last_close), "source": "Yahoo"}
-        except Exception as e:
-            logger.info("yfinance quote failed for %s: %s", s, str(e))
-
-    # nothing found
+    logger.info("No provider returned price for %s", s)
     return None
 
 
 def fetch_profile(symbol: str, api_key: Optional[str]) -> dict:
-    """
-    Fetch company profile from FMP; returns the profile dict or {} on failure.
-    """
     if not api_key:
         return {}
     try:
@@ -159,50 +179,28 @@ def fetch_profile(symbol: str, api_key: Optional[str]) -> dict:
 
 
 # ------------------------------
-# NSEpy fallback
+# NSEpy history
 # ------------------------------
 def _fetch_history_nsepy(symbol: str, period_years: int = 3) -> List[dict]:
-    """
-    Use nsepy to fetch Indian ticker history. Returns newest-first list of dicts.
-    If nsepy not available or returns nothing, returns [].
-    """
     try:
-        from nsepy import get_history  # lazy import
+        from nsepy import get_history
     except Exception as e:
         logger.info("nsepy not available: %s", str(e))
         return []
-
     s = symbol.strip().upper()
-    # Candidate forms to try
-    if "." in s:
-        candidates = [s, s.replace(".NS", ""), s.replace(".BO", "")]
-    else:
-        # prefer plain ticker (nsepy expects symbol without suffix), then suffixes
-        candidates = [s, s + ".NS", s + ".BO"]
-
-    # dedupe preserve order
-    seen = set()
-    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
-
-    end = date.today()
-    start = end - timedelta(days=365 * period_years)
-
+    candidates = [s, s.replace(".NS", ""), s.replace(".BO", "")]
+    seen = set(); candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+    end = date.today(); start = end - timedelta(days=365 * period_years)
     for cand in candidates:
         try:
-            # nsepy get_history expects symbol without exchange suffix in many cases
-            symbol_for_nsepy = cand.split(".")[0]
-            df = get_history(symbol=symbol_for_nsepy, start=start, end=end)
+            sym_for_nse = cand.split(".")[0]
+            df = get_history(symbol=sym_for_nse, start=start, end=end)
             if df is None or df.empty:
-                logger.info("nsepy returned empty for candidate %s", cand)
                 continue
             df = df.reset_index()
             rows = []
             for _, r in df.iterrows():
-                date_val = r.get("Date") or r.get("date") or None
-                if hasattr(date_val, "strftime"):
-                    dstr = date_val.strftime("%Y-%m-%d")
-                else:
-                    dstr = str(date_val)
+                dstr = r["Date"].strftime("%Y-%m-%d") if hasattr(r.get("Date"), "strftime") else str(r.get("Date"))
                 rows.append({
                     "date": dstr,
                     "open": float(r.get("Open", 0) or 0),
@@ -212,49 +210,34 @@ def _fetch_history_nsepy(symbol: str, period_years: int = 3) -> List[dict]:
                     "volume": int(r.get("Volume", 0) or 0)
                 })
             if rows:
-                # oldest-first -> newest-first
                 return list(reversed(rows))
         except Exception as ex:
-            logger.info("nsepy candidate %s failed: %s", cand, str(ex))
+            logger.info("nsepy history failed %s: %s", cand, str(ex))
             continue
     return []
 
 
 # ------------------------------
-# yfinance fallback
+# yfinance history
 # ------------------------------
 def _fetch_history_yfinance(symbol: str, period: str = "2y", interval: str = "1d") -> List[dict]:
-    """
-    Try multiple variants with yfinance. Return newest-first list of dicts or [].
-    """
     if not YFINANCE_AVAILABLE:
         return []
-
     s = symbol.strip().upper()
-    candidates = []
-    if "." in s:
-        candidates = [s, s.replace(".NS", ""), s.replace(".BO", "")]
-    else:
-        candidates = [s + ".NS", s + ".BO", s, s + ".NSE"]
-
-    candidates = list(dict.fromkeys(candidates))
+    candidates = [s + ".NS", s, s + ".BO", s + ".NSE"]
+    seen = set(); candidates = [c for c in candidates if not (c in seen or seen.add(c))]
     for cand in candidates:
         try:
             t = yf.Ticker(cand)
-            df = t.history(period=period, interval=interval, auto_adjust=False)
+            df = t.history(period=period, interval=interval)
             if df is None or df.empty:
-                logger.info("yfinance returned empty for %s", cand)
                 continue
             df = df.reset_index()
             rows = []
             for _, r in df.iterrows():
-                date_val = r.get('Date') or r.get('date') or None
-                if hasattr(date_val, 'strftime'):
-                    date = date_val.strftime("%Y-%m-%d")
-                else:
-                    date = str(date_val)
+                dstr = r["Date"].strftime("%Y-%m-%d") if hasattr(r.get("Date"), "strftime") else str(r.get("Date"))
                 rows.append({
-                    "date": date,
+                    "date": dstr,
                     "open": float(r.get('Open', 0) or 0),
                     "high": float(r.get('High', 0) or 0),
                     "low": float(r.get('Low', 0) or 0),
@@ -262,26 +245,18 @@ def _fetch_history_yfinance(symbol: str, period: str = "2y", interval: str = "1d
                     "volume": int(r.get('Volume', 0) or 0)
                 })
             if rows:
-                # old->new -> reverse -> newest-first
                 return list(reversed(rows))
         except Exception as e:
-            logger.info("yfinance candidate %s failed: %s", cand, str(e))
+            logger.info("yfinance history failed %s: %s", cand, str(e))
             continue
     return []
 
 
 # ------------------------------
-# Main fetch_history with FMP -> NSEpy -> yfinance fallback
+# Main fetch_history
 # ------------------------------
 def fetch_history(symbol: str, api_key: Optional[str], timeseries: int = 180) -> Tuple[List[dict], str]:
-    """
-    Return tuple (rows, source) where rows is list of historical bars (dicts) newest-first and
-    source is a short string describing the data source: "FMP (ts=...)", "NSEpy", or "Yahoo".
-    Order: try FMP (descending windows) -> NSEpy (Indian) -> yfinance -> raise RuntimeError.
-    """
     tried = []
-
-    # 1) Try FMP if key provided
     if api_key:
         sym = resolve_symbol(symbol, api_key)
         for ts in (timeseries, 365, 180, 90, 30):
@@ -294,45 +269,15 @@ def fetch_history(symbol: str, api_key: Optional[str], timeseries: int = 180) ->
                     hist = j.get("historical") or []
                     if hist:
                         logger.info("Fetched %d rows from FMP for %s (ts=%d)", len(hist), sym, ts)
-                        # assume FMP is newest-first; return as-is
                         return hist, f"FMP (ts={ts})"
-                    logger.info("FMP returned empty historical for %s (ts=%d)", sym, ts)
-                    time.sleep(0.12)
-                    continue
                 elif r.status_code == 403:
-                    logger.warning("FMP returned 403 for %s (ts=%d) — trying smaller window", sym, ts)
-                    time.sleep(0.12)
-                    continue
-                else:
-                    logger.warning("FMP returned status %s for %s (ts=%d); trying next", r.status_code, sym, ts)
-                    time.sleep(0.12)
-                    continue
-            except requests.RequestException as rexc:
-                logger.info("Network error fetching FMP for %s (ts=%d): %s", sym, ts, str(rexc))
-                time.sleep(0.15)
-                continue
-
-    # 2) Try NSEpy (best for Indian tickers)
-    try:
-        nse_rows = _fetch_history_nsepy(symbol, period_years=3)
-        if nse_rows:
-            logger.info("Using NSEpy fallback for %s; rows=%d", symbol, len(nse_rows))
-            return nse_rows, "NSEpy"
-    except Exception as e:
-        logger.info("NSEpy fallback raised exception for %s: %s", symbol, str(e))
-
-    # 3) Try yfinance fallback
-    try:
-        yf_rows = _fetch_history_yfinance(symbol, period="2y")
-        if yf_rows:
-            logger.info("Using yfinance fallback for %s; rows=%d", symbol, len(yf_rows))
-            return yf_rows, "Yahoo"
-    except Exception as e:
-        logger.info("yfinance fallback raised exception for %s: %s", symbol, str(e))
-
-    # 4) Nothing worked
-    raise RuntimeError(
-        f"Unable to fetch historical data for {symbol}. Tried FMP timeseries: {tried}. "
-        "This usually means your FMP API key/plan doesn't allow historical endpoints or you hit rate limits. "
-        "Try providing a different API key in the app or use a paid plan."
-    )
+                    logger.warning("FMP 403 for %s (ts=%d)", sym, ts)
+            except Exception as e:
+                logger.info("FMP fetch error %s: %s", sym, str(e))
+    nse_rows = _fetch_history_nsepy(symbol, 3)
+    if nse_rows:
+        return nse_rows, "NSEpy"
+    yf_rows = _fetch_history_yfinance(symbol, "2y")
+    if yf_rows:
+        return yf_rows, "Yahoo"
+    raise RuntimeError(f"No history for {symbol}. Tried {tried}.")
